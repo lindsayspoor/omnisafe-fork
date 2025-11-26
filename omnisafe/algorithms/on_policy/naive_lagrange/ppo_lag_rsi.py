@@ -21,6 +21,7 @@ from omnisafe.algorithms import registry
 from omnisafe.algorithms.on_policy.base.ppo import PPO
 from omnisafe.common.lagrange import Lagrange
 
+from typing import Optional
 
 def _global_grad_norm(grads):
     # grads: list[Tensor]
@@ -43,6 +44,8 @@ class PPOLagRSI(PPO):
         The PPOLag algorithm uses a Lagrange multiplier to balance the cost and reward.
         """
         super()._init()
+        self._last_adv_r = None
+        self._last_adv_c = None
         self._lagrange: Lagrange = Lagrange(**self._cfgs.lagrange_cfgs)
 
         # ---- RSI beta-grad settings (add to yaml or hardcode) ----
@@ -51,23 +54,42 @@ class PPOLagRSI(PPO):
         self._beta_grad_clip = getattr(self._cfgs.algo_cfgs, "beta_grad_clip", None)
         self._beta_grad = None  # running value
 
-    def _loss_pi(self, data: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict]:
-        """PPO clipped loss, but with beta_grad scaling from Stooke20 Sec.7."""
-        obs, act = data["obs"], data["act"]
-        adv_r, adv_c = data["adv_r"], data["adv_c"]
-        logp_old = data["logp"]
+    def _loss_pi(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        logp: torch.Tensor,
+        adv: torch.Tensor,
+    ) -> torch.Tensor:
+        """Signature-compatible PPO actor loss + beta-grad RSI."""
 
-        # forward current policy
-        pi, logp = self._actor_critic.actor(obs, act)
-        ratio = torch.exp(logp - logp_old)
+        # ----- standard PPO forward -----
+        distribution = self._actor_critic.actor(obs)
+        logp_ = self._actor_critic.actor.log_prob(act)
+        std = self._actor_critic.actor.std
 
-        # --- reward-only and cost-only policy losses (unclipped) ---
+        ratio = torch.exp(logp_ - logp)
+        ratio_cliped = torch.clamp(
+            ratio,
+            1 - self._cfgs.algo_cfgs.clip,
+            1 + self._cfgs.algo_cfgs.clip,
+        )
+
+        # ----- retrieve cached reward/cost advantages -----
+        adv_r = self._last_adv_r
+        adv_c = self._last_adv_c
+        if adv_r is None or adv_c is None:
+            raise RuntimeError(
+                "adv_r/adv_c not cached. "
+                "Make sure _compute_adv_surrogate() runs before _loss_pi()."
+            )
+
+        # ----- compute beta_grad from reward-only vs cost-only grads -----
         loss_r = -(ratio * adv_r).mean()
         loss_c = -(ratio * adv_c).mean()
 
         actor_params = [p for p in self._actor_critic.actor.parameters() if p.requires_grad]
 
-        # grads for norms
         g_r = torch.autograd.grad(loss_r, actor_params, retain_graph=True, create_graph=False)
         g_c = torch.autograd.grad(loss_c, actor_params, retain_graph=True, create_graph=False)
 
@@ -76,37 +98,42 @@ class PPOLagRSI(PPO):
 
         beta = (norm_r / (norm_c + self._beta_grad_eps)).detach()
 
-        # optional EMA smoothing
+        # EMA smoothing
         if self._beta_grad is None:
             self._beta_grad = beta
         else:
             self._beta_grad = self._beta_grad_ema * self._beta_grad + (1 - self._beta_grad_ema) * beta
 
         beta_used = self._beta_grad
-
-        # optional clipping for stability
         if self._beta_grad_clip is not None:
             beta_used = torch.clamp(beta_used, 1.0 / self._beta_grad_clip, self._beta_grad_clip)
 
-        # ---- Stooke-style beta scaling inside surrogate ----
+        # ----- re-build RSI mixed advantage and overwrite adv -----
         penalty = self._lagrange.lagrangian_multiplier.detach()
         adv_mix = (adv_r - penalty * beta_used * adv_c) / (1.0 + penalty)
 
-        # ---- standard PPO-Clip objective on adv_mix ----
-        clip = self._cfgs.algo_cfgs.clip
-        ratio_clip = torch.clamp(ratio, 1 - clip, 1 + clip)
+        # ----- PPO-Clip loss on adv_mix -----
+        loss = -torch.min(ratio * adv_mix, ratio_cliped * adv_mix).mean()
 
-        loss_pi = -(torch.min(ratio * adv_mix, ratio_clip * adv_mix)).mean()
+        # entropy bonus (same as base PPO)
+        loss -= self._cfgs.algo_cfgs.entropy_coef * distribution.entropy().mean()
 
-        # logging extras
-        info = {
-            "Loss/LossPi": loss_pi.detach(),
-            "Misc/BetaGrad": beta_used.detach(),
-            "Misc/GradNormR": norm_r.detach(),
-            "Misc/GradNormC": norm_c.detach(),
-            "Misc/Penalty": penalty.detach(),
-        }
-        return loss_pi, info
+        # ----- logging (same keys style as base PPO + RSI extras) -----
+        entropy = distribution.entropy().mean().item()
+        self._logger.store(
+            {
+                'Train/Entropy': entropy,
+                'Train/PolicyRatio': ratio,
+                'Train/PolicyStd': std,
+                'Loss/Loss_pi': loss.mean().item(),
+                'Misc/BetaGrad': beta_used.item(),
+                'Misc/GradNormR': norm_r.item(),
+                'Misc/GradNormC': norm_c.item(),
+                'Misc/Penalty': penalty.item(),
+            },
+        )
+
+        return loss
 
     def _init_log(self) -> None:
         """Log the PPOLag specific information.
@@ -119,6 +146,10 @@ class PPOLagRSI(PPO):
         """
         super()._init_log()
         self._logger.register_key('Metrics/LagrangeMultiplier', min_and_max=True)
+        self._logger.register_key('Misc/BetaGrad', min_and_max=True)
+        self._logger.register_key('Misc/GradNormR', min_and_max=True)
+        self._logger.register_key('Misc/GradNormC', min_and_max=True)
+        self._logger.register_key('Misc/Penalty', min_and_max=True)
 
     def _update(self) -> None:
         r"""Update actor, critic, as we used in the :class:`PolicyGradient` algorithm.
@@ -169,5 +200,9 @@ class PPOLagRSI(PPO):
         Returns:
             The advantage function combined with reward and cost.
         """
-        penalty = self._lagrange.lagrangian_multiplier.item()
-        return (adv_r - penalty * adv_c) / (1 + penalty)
+        self._last_adv_r = adv_r
+        self._last_adv_c = adv_c
+
+        penalty = self._lagrange.lagrangian_multiplier.detach()
+        # IMPORTANT: don't apply beta here anymore; _loss_pi will.
+        return (adv_r - penalty * adv_c) / (1.0 + penalty)

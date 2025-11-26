@@ -50,7 +50,7 @@ def get_activation(
     """Get the activation function.
 
     The ``activation`` can be chosen from: ``identity``, ``relu``, ``sigmoid``, ``softplus``,
-    ``tanh``.
+    ``tanh``. ADDED: ELU    
 
     Args:
         activation (Activation): The activation function.
@@ -65,6 +65,7 @@ def get_activation(
         'sigmoid': nn.Sigmoid,
         'softplus': nn.Softplus,
         'tanh': nn.Tanh,
+        'elu': nn.ELU,
     }
     assert activation in activations
     return activations[activation]
