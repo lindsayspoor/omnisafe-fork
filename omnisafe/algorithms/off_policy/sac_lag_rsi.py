@@ -51,6 +51,9 @@ class SACLagRSI(SAC):
         self._beta_grad_ema = getattr(self._cfgs.algo_cfgs, "beta_grad_ema", 0.9)
         self._beta_grad_eps = getattr(self._cfgs.algo_cfgs, "beta_grad_eps", 1e-8)
         self._beta_grad_clip = getattr(self._cfgs.algo_cfgs, "beta_grad_clip", None)
+        self._beta_grad_every = getattr(self._cfgs.algo_cfgs, "beta_grad_every", 50)
+        self._beta_grad_batch = getattr(self._cfgs.algo_cfgs, "beta_grad_batch", 128)
+        self._pi_update_count = 0
         self._beta_grad: Optional[torch.Tensor] = None  # running value (EMA)
 
     def _init_log(self) -> None:
@@ -75,12 +78,13 @@ class SACLagRSI(SAC):
         )
 
     def _loss_pi(self, obs: torch.Tensor) -> torch.Tensor:
-        """Compute SAC actor loss with RSI beta-grad scaling.
+        """Compute SAC actor loss with RSI beta-grad scaling (optimized).
 
-        Base SACLagRSI actor loss:
-            L = alpha * log_pi(a|s) - Q_r(s,a) + lambda * beta * Q_c(s,a)
-
-        and keeps the normalization / (1 + lambda) like PPOLag does.
+        Changes vs your original:
+        - Recompute beta-grad only every `algo_cfgs.beta_grad_every` policy updates (default 50).
+        - Compute beta-grad on a smaller sub-batch `algo_cfgs.beta_grad_batch` (default 128).
+        - Avoid retaining autograd graph longer than needed (retain_graph only for first grad).
+        - Reuse EMA beta between recomputations; default beta=1.0 until first compute.
         """
         # ----- standard SAC forward -----
         action = self._actor_critic.actor.predict(obs, deterministic=False)
@@ -94,50 +98,92 @@ class SACLagRSI(SAC):
         # penalty (lambda)
         penalty = self._lagrange.lagrangian_multiplier.detach()
 
-        # ----- reward-only and cost-only losses (for beta-grad computation) -----
-        # Reward part matches the original SACLag reward term:
-        #   loss_r = alpha*log_pi - Q_r
+        # reward-only and cost-only losses (for beta-grad computation)
         loss_r = (self._alpha * log_prob - q_r).mean()
-
-        # Cost-only part should induce gradients proportional to Q_c term.
-        # We use mean(Q_c) (NOT multiplied by lambda) so beta captures relative scales.
         loss_c = q_c.mean()
 
-        # ----- compute beta_grad from reward-only vs cost-only grads -----
-        actor_params = [p for p in self._actor_critic.actor.parameters() if p.requires_grad]
+        # ----- RSI beta-grad (throttled) -----
+        # Read settings (safe defaults if not defined in cfgs)
+        beta_grad_every = getattr(self._cfgs.algo_cfgs, "beta_grad_every", 50)
+        beta_grad_batch = getattr(self._cfgs.algo_cfgs, "beta_grad_batch", 128)
 
-        g_r = torch.autograd.grad(loss_r, actor_params, retain_graph=True, create_graph=False)
-        g_c = torch.autograd.grad(loss_c, actor_params, retain_graph=True, create_graph=False)
+        # Initialize/update a counter (don’t assume _init was patched)
+        if not hasattr(self, "_pi_update_count"):
+            self._pi_update_count = 0
+        self._pi_update_count += 1
 
-        norm_r = _global_grad_norm(g_r)
-        norm_c = _global_grad_norm(g_c)
-
-        beta = (norm_r / (norm_c + self._beta_grad_eps)).detach()
-
-        # EMA smoothing
+        # Default beta_used: previous EMA value, else 1.0 until first compute
         if self._beta_grad is None:
-            self._beta_grad = beta
+            beta_used = torch.tensor(1.0, device=obs.device)
         else:
-            self._beta_grad = self._beta_grad_ema * self._beta_grad + (1 - self._beta_grad_ema) * beta
+            beta_used = self._beta_grad
 
-        beta_used = self._beta_grad
+        do_recompute = (self._beta_grad is None) or (beta_grad_every > 0 and self._pi_update_count % beta_grad_every == 0)
+
+        norm_r = torch.tensor(float("nan"), device=obs.device)
+        norm_c = torch.tensor(float("nan"), device=obs.device)
+
+        if do_recompute:
+            # Use a smaller sub-batch for beta-grad to reduce overhead
+            obs_beta = obs
+            if beta_grad_batch is not None and beta_grad_batch > 0 and obs.shape[0] > beta_grad_batch:
+                idx = torch.randint(0, obs.shape[0], (beta_grad_batch,), device=obs.device)
+                obs_beta = obs[idx]
+
+            # Recompute losses on obs_beta (so grads correspond to the sub-batch)
+            action_b = self._actor_critic.actor.predict(obs_beta, deterministic=False)
+            log_prob_b = self._actor_critic.actor.log_prob(action_b)
+
+            q_r_1_b, q_r_2_b = self._actor_critic.reward_critic(obs_beta, action_b)
+            q_r_b = torch.min(q_r_1_b, q_r_2_b)
+            q_c_b = self._actor_critic.cost_critic(obs_beta, action_b)[0]
+
+            loss_r_b = (self._alpha * log_prob_b - q_r_b).mean()
+            loss_c_b = q_c_b.mean()
+
+            actor_params = [p for p in self._actor_critic.actor.parameters() if p.requires_grad]
+
+            # Retain graph only until both grads are extracted
+            g_r = torch.autograd.grad(loss_r_b, actor_params, retain_graph=True, create_graph=False)
+            g_c = torch.autograd.grad(loss_c_b, actor_params, retain_graph=False, create_graph=False)
+
+            norm_r = _global_grad_norm(g_r)
+            norm_c = _global_grad_norm(g_c)
+
+            beta = (norm_r / (norm_c + self._beta_grad_eps)).detach()
+
+            # EMA smoothing
+            if self._beta_grad is None:
+                self._beta_grad = beta
+            else:
+                self._beta_grad = self._beta_grad_ema * self._beta_grad + (1 - self._beta_grad_ema) * beta
+
+            beta_used = self._beta_grad
 
         # Optional clipping for stability
         if self._beta_grad_clip is not None:
             beta_used = torch.clamp(beta_used, 1.0 / self._beta_grad_clip, self._beta_grad_clip)
 
         # ----- final RSI-mixed SAC-Lagrangian loss -----
-        # Base cost term is + lambda * Q_c (since we minimize loss)
         loss = loss_r + (penalty * beta_used * loss_c)
         loss = loss / (1.0 + penalty)
 
-        # ----- logging  -----
+        # ----- logging -----
+        # If we didn't recompute norms this step, log last known values if available.
+        if not do_recompute and hasattr(self, "_last_norm_r") and hasattr(self, "_last_norm_c"):
+            norm_r = self._last_norm_r
+            norm_c = self._last_norm_c
+        else:
+            # Store latest norms if they are finite
+            self._last_norm_r = norm_r.detach()
+            self._last_norm_c = norm_c.detach()
+
         self._logger.store(
             {
-                'Misc/BetaGrad': beta_used.item(),
-                'Misc/GradNormR': norm_r.item(),
-                'Misc/GradNormC': norm_c.item(),
-                'Misc/Penalty': penalty.item(),
+                'Misc/BetaGrad': float(beta_used.item()),
+                'Misc/GradNormR': float(norm_r.item()) if torch.isfinite(norm_r) else float("nan"),
+                'Misc/GradNormC': float(norm_c.item()) if torch.isfinite(norm_c) else float("nan"),
+                'Misc/Penalty': float(penalty.item()),
             },
         )
 
