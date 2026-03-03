@@ -82,6 +82,8 @@ defaults:
     beta_grad_ema: 0.9        # EMA smoothing for beta (0.0 = no smoothing)
     beta_grad_eps: 1.0e-8     # numerical stability
     beta_grad_clip: null      # optional; set to null to disable clipping
+    beta_grad_every: 50      # recompute beta-grad once every N policy updates
+    beta_grad_batch: 128     # sub-batch size used for beta-grad estimation
   # logger configurations
   logger_cfgs:
     # use wandb for logging
